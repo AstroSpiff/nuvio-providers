@@ -130,7 +130,7 @@ async function resolveVixCloudLike(url){
 
   // Referer: la pagina che abbiamo usato (preferisci l'URL passato alla funzione)
   const referer = url;
-
+  log("DEBUG HLS URL => " + finalUrl);
   return { hlsUrl: finalUrl, referer };
 }
 
