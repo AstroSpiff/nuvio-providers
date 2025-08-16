@@ -8,9 +8,10 @@
       "description": "VixSrc con preferenza italiana (lang=it), risoluzione diretta degli M3U8; fallback su embed.",
       "version": "1.0.0",
       "author": "Roy + Assistant",
-      "types": ["movie", "tv"],
-      "file": "providers/vixsrc_ita_direct.js",
-      "enabled": true
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/vixsrc_ita_direct.js",
+      "enabled": true,
+      "contentLanguage": ["it"]
     }
   ]
 }
