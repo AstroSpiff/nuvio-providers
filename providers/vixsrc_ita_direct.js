@@ -1,8 +1,16 @@
 // providers/vixsrc_ita_direct.js
 //
-// VixSrc (ITA • Direct) — HLS
-// Evidenzia HLS per Nuvio/ExoPlayer: type:"hls", mimeType e isHls:true.
-// Referer solo dove serve; niente Origin di default.
+// VixSrc (ITA • Direct) — RISOLUZIONE NATIVA VIXCLOUD
+// Implementa in JS la logica del tuo vixcloud.py (MediaFlow-Proxy):
+// - se l'URL contiene /iframe, recupera la "version" (X-Inertia) dalla pagina /request-a-title
+//   e poi segue l'iframe con gli header x-inertia per ottenere la pagina effettiva
+// - se l'URL è /movie o /tv, scarica direttamente la pagina
+// - estrae da <script> i campi: token, expires, server_url e (opz.) canPlayFHD -> &h=1
+// - costruisce l'URL HLS finale ?token=...&expires=... [&h=1], con gestione ?b=1 (usa &token)
+// - restituisce stream HLS con headers (Referer) corretti
+//
+// Output stream per Nuvio/ExoPlayer: type:"hls" + mimeType + isHls:true
+// Verifica reale HLS (#EXTM3U) per evitare HTML/403.
 
 const VIXSRC_BASE = 'https://vixsrc.to';
 const FETCH_TIMEOUT = 15000;
@@ -20,17 +28,7 @@ const HDR_JSON = {
   'Accept-Language': HDR_HTML['Accept-Language']
 };
 
-function hlsHeaders(referer) {
-  return {
-    'User-Agent': HDR_HTML['User-Agent'],
-    'Accept': 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
-    'Referer': referer || (VIXSRC_BASE + '/')
-    // NIENTE Origin: alcuni CDN lo rifiutano
-  };
-}
-
 const QUALITY_ORDER = ['2160p','4K','1440p','1080p','720p','480p','360p'];
-const RAPIDCLOUD_HOST_HINTS = ['rabbitstream','rapid-cloud','vizcloud','vidcloud','mzzcloud','rcp'];
 
 function log(m){ try{ console.log('[VixSrcITA-Direct] ' + m);}catch(_){} }
 function withTimeout(p,ms){ return new Promise((res,rej)=>{ const t=setTimeout(()=>rej(new Error('timeout '+ms+'ms')),ms); p.then(v=>{clearTimeout(t);res(v);},e=>{clearTimeout(t);rej(e);});}); }
@@ -41,30 +39,7 @@ async function getText(url, headers){
   if(!r || !r.ok) throw new Error('HTTP ' + (r?r.status:'ERR') + ' su ' + url);
   return await r.text();
 }
-async function getJson(url, headers){
-  log('GET JSON ' + url);
-  const r = await withTimeout(fetch(url,{method:'GET', headers: headers||HDR_JSON}), FETCH_TIMEOUT);
-  if(!r || !r.ok) throw new Error('HTTP ' + (r?r.status:'ERR') + ' su ' + url);
-  return await r.json();
-}
 
-function extractAllM3U8(text){
-  if(!text) return [];
-  const re=/https?:\/\/[^\s"'<>]+?\.m3u8(?:\?[^\s"'<>]*)?/gi;
-  const arr=[]; let m; while((m=re.exec(text))!==null) arr.push(m[0]);
-  const seen={}; const uniq=[]; for(let u of arr){ if(!seen[u]){ seen[u]=true; uniq.push(u);} }
-  return uniq;
-}
-function firstIframeSrc(html, baseUrl){
-  const re=/<iframe[^>]*\s+src=["']([^"'<>]+)["'][^>]*>/i;
-  const m=re.exec(html);
-  if(!m||!m[1]) return null;
-  try { return new URL(m[1], baseUrl).toString(); } catch { return m[1]; }
-}
-function containsRapidCloudHost(url){
-  const u=(url||'').toLowerCase();
-  return RAPIDCLOUD_HOST_HINTS.some(h=>u.includes(h));
-}
 function qFromText(t){
   if(!t) return 'Unknown';
   const T=String(t).toUpperCase();
@@ -73,68 +48,100 @@ function qFromText(t){
 }
 function qSortVal(q){ const m=(q||'').match(/(\d{3,4})p/i); return m?parseInt(m[1],10):(String(q).toUpperCase()==='4K'?4000:0); }
 
+// ---- Costruzione URL embed VixSrc (ITA) ----
 function buildEmbed(mediaType, tmdbId, s, e){
   const base = VIXSRC_BASE.replace(/\/+$/,'');
   if(mediaType==='tv'){ if(!s||!e) return null; return `${base}/tv/${encodeURIComponent(String(tmdbId))}/${encodeURIComponent(String(s))}/${encodeURIComponent(String(e))}?lang=it`; }
   return `${base}/movie/${encodeURIComponent(String(tmdbId))}?lang=it`;
 }
 
-async function resolveFromEmbed(embedUrl){
-  const html = await getText(embedUrl, HDR_HTML);
-  return { m3u8s: extractAllM3U8(html), iframe: firstIframeSrc(html, embedUrl), html };
-}
-async function resolveFromIframe(iframeUrl){
-  if(!iframeUrl) return [];
-  const html = await getText(iframeUrl, { ...HDR_HTML, Referer: iframeUrl });
-  return extractAllM3U8(html);
-}
-async function resolveRapidCloud(iframeUrl){
-  try{
-    const u = new URL(iframeUrl);
-    const origin = u.origin;
-    const html = await getText(iframeUrl, { ...HDR_HTML, Referer: iframeUrl });
-
-    let id=null, m=null;
-    m=html.match(/data-id=["']([A-Za-z0-9_-]{6,})["']/i); if(m&&m[1]) id=m[1];
-    if(!id){ m=html.match(/\sid=["']([A-Za-z0-9_-]{6,})["']/i); if(m&&m[1]) id=m[1]; }
-    if(!id){ m=html.match(/id["'\s=:]+([A-Za-z0-9_-]{6,})/i) || html.match(/getSources\?id=([A-Za-z0-9_-]{6,})/i); if(m&&m[1]) id=m[1]; }
-    if(!id) return [];
-
-    const endpoints=[ `${origin}/ajax/embed-4/getSources?id=${encodeURIComponent(id)}`, `${origin}/ajax/embed/getSources?id=${encodeURIComponent(id)}` ];
-    const headers={ ...HDR_JSON, 'X-Requested-With':'XMLHttpRequest', 'Referer': iframeUrl };
-
-    for(let ep of endpoints){
-      try{
-        const j = await getJson(ep, headers);
-        const out = collectRapidJson(j);
-        if(out.length) return out.map(o=>({ ...o, _referer: iframeUrl }));
-      }catch(_){}
-    }
-
-    const inner = firstIframeSrc(html, iframeUrl);
-    if(inner){
-      const more = await resolveFromIframe(inner);
-      return more.map(u=>({ url:u, label:'Stream', _referer: iframeUrl }));
-    }
-  }catch(_){}
-  return [];
-}
-function collectRapidJson(j){
-  const out=[]; const push=(url,label)=>{ if(url && /\.m3u8(\?|$)/i.test(url)) out.push({url,label:label||'Stream'}); };
-  if(!j) return out;
-  if(typeof j==='string'){ push(j,'Stream'); return out; }
-  if(j.hls) push(j.hls,'HLS');
-  const arr1 = Array.isArray(j.sources)? j.sources : null;
-  const arr2 = j.data && Array.isArray(j.data.sources) ? j.data.sources : null;
-  const arr = arr1 || arr2 || [];
-  for(let it of arr){ push(it && (it.file||it.url), it && (it.label||it.quality)); }
-  return out;
+// ---- Utilità parsing ----
+function firstIframeSrc(html, baseUrl){
+  const re=/<iframe[^>]*\s+src=["']([^"'<>]+)["'][^>]*>/i;
+  const m=re.exec(html);
+  if(!m||!m[1]) return null;
+  try { return new URL(m[1], baseUrl).toString(); } catch { return m[1]; }
 }
 
-// Verifica che risponda davvero una playlist HLS (#EXTM3U)
+// Estrae "version" dal JSON nel div#app data-page (come in vixcloud.py)
+async function fetchVixVersion(siteUrl){
+  const url = siteUrl.replace(/\/+$/,'') + '/request-a-title';
+  const txt = await getText(url, {
+    ...HDR_HTML,
+    Referer: siteUrl.replace(/\/+$/,'') + '/',
+    Origin: siteUrl.replace(/\/+$/,'')
+  });
+  // Cerca <div id="app" data-page="...json...">
+  const m = txt.match(/<div[^>]+id=["']app["'][^>]+data-page=["']([^"']+)["']/i);
+  if(!m || !m[1]) throw new Error('VixCloud version: div#app data-page non trovato');
+  try {
+    const data = JSON.parse(m[1]);
+    if (!data || !data.version) throw new Error('version non presente');
+    return String(data.version);
+  } catch(e) {
+    throw new Error('VixCloud version parse error: ' + e.message);
+  }
+}
+
+// Implementazione JS del flusso di vixcloud.py
+// Ritorna { hlsUrl, referer }
+async function resolveVixCloudLike(url){
+  let responseHtml = '';
+  if (url.includes('/iframe')) {
+    // 1) prendi site_url prima di /iframe
+    const siteUrl = url.split('/iframe')[0];
+    const version = await fetchVixVersion(siteUrl);
+
+    // 2) GET dell'URL /iframe con header inertia per ottenere la pagina con <iframe src=...>
+    const txtIframeWrap = await getText(url, { ...HDR_HTML, 'x-inertia':'true', 'x-inertia-version': version });
+    const innerIframe = firstIframeSrc(txtIframeWrap, url);
+    if (!innerIframe) throw new Error('iframe interno non trovato');
+    // 3) GET dell'iframe interno con inertia headers
+    responseHtml = await getText(innerIframe, { ...HDR_HTML, 'x-inertia':'true', 'x-inertia-version': version });
+  } else if (url.includes('/movie') || url.includes('/tv')) {
+    // pagina embed diretta
+    responseHtml = await getText(url, HDR_HTML);
+  } else {
+    // fallback: scarica comunque
+    responseHtml = await getText(url, HDR_HTML);
+  }
+
+  // Nel body/script sono presenti: 'token':'xxx', 'expires':'123456', url:'https://...m3u8...'
+  const scriptTextMatch = responseHtml.match(/<body[^>]*>[\s\S]*?<script[^>]*>([\s\S]*?)<\/script>/i);
+  const scriptText = scriptTextMatch ? scriptTextMatch[1] : responseHtml;
+
+  const tokenM = scriptText.match(/'token'\s*:\s*'([A-Za-z0-9_]+)'/i);
+  const expM   = scriptText.match(/'expires'\s*:\s*'(\d+)'/i);
+  const urlM   = scriptText.match(/url\s*:\s*'([^']+)'/i);
+
+  if (!tokenM || !expM || !urlM) throw new Error('Parametri mancanti (token/expires/url)');
+
+  const token   = tokenM[1];
+  const expires = expM[1];
+  let   server  = urlM[1];
+
+  // Se "window.canPlayFHD = true" -> aggiungi &h=1
+  const fhd = /window\.canPlayFHD\s*=\s*true/i.test(scriptText);
+
+  // Se server_url contiene ?b=1 allora aggiungiamo i parametri con "&", altrimenti con "?"
+  const sep = server.includes('?') ? '&' : '?';
+  let finalUrl = `${server}${sep}token=${encodeURIComponent(token)}&expires=${encodeURIComponent(expires)}`;
+  if (fhd) finalUrl += '&h=1';
+
+  // Referer: la pagina che abbiamo usato (preferisci l'URL passato alla funzione)
+  const referer = url;
+
+  return { hlsUrl: finalUrl, referer };
+}
+
+// Verifica che sia davvero una playlist HLS (#EXTM3U)
 async function verifyIsHls(url, referer){
   try{
-    const r = await withTimeout(fetch(url,{ method:'GET', headers: hlsHeaders(referer) }), 12000);
+    const r = await withTimeout(fetch(url,{ method:'GET', headers: {
+      'User-Agent': HDR_HTML['User-Agent'],
+      'Accept': 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
+      'Referer': referer
+    }}), 12000);
     if(!r || !r.ok) return false;
     const txt = await r.text();
     return /^#EXTM3U/.test(txt.trim().slice(0,1024));
@@ -148,11 +155,15 @@ function buildHlsStream(url, label, referer){
     title: (q && q!=='Unknown') ? (q + ' • ITA') : 'Stream • ITA',
     url,
     quality: q || 'Unknown',
-    // *** Segnala HLS in tutti i modi ***
     type: 'hls',
     mimeType: 'application/vnd.apple.mpegurl',
     isHls: true,
-    headers: hlsHeaders(referer)
+    headers: {
+      'User-Agent': HDR_HTML['User-Agent'],
+      'Accept': 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
+      'Referer': referer
+      // niente Origin: alcuni CDN lo rifiutano
+    }
   };
 }
 
@@ -167,43 +178,39 @@ function buildExternal(embedUrl){
   };
 }
 
+// =====================
+// API principale
+// =====================
 async function getStreams(tmdbId, mediaType='movie', seasonNum=null, episodeNum=null){
   try{
     const embed = buildEmbed(mediaType, tmdbId, seasonNum, episodeNum);
     if(!embed) return [];
 
-    const resA = await resolveFromEmbed(embed);
-    let pool = (resA.m3u8s||[]).map(u=>({url:u,label:'Stream',_referer:embed}));
+    // 1) Se l'embed ha un iframe VixCloud, risolviamo direttamente con la logica vixcloud.py
+    //    Altrimenti, proviamo prima a vederlo come /movie|/tv (il resolver gestisce entrambi i casi)
+    //    NB: preferiamo passare prima l'URL embed (che spesso contiene /movie|/tv)
+    let targetUrl = embed;
 
-    const iframeUrl = resA.iframe || null;
-    if(iframeUrl){
-      const more = await resolveFromIframe(iframeUrl);
-      pool = pool.concat(more.map(u=>({url:u,label:'Stream',_referer:iframeUrl})));
-    }
-    if(iframeUrl && containsRapidCloudHost(iframeUrl)){
-      const rc = await resolveRapidCloud(iframeUrl);
-      pool = pool.concat(rc||[]);
-    }
+    // Piccolo tentativo per catturare subito l'iframe (così usiamo quello come referer):
+    try {
+      const html = await getText(embed, HDR_HTML);
+      const iframe = firstIframeSrc(html, embed);
+      if (iframe) targetUrl = iframe; // più vicino alla sorgente reale (referer corretto)
+    } catch(_) {}
 
-    // dedup
-    const seen={}, uniq=[];
-    for(const c of pool){ if(c && c.url && !seen[c.url]){ seen[c.url]=true; uniq.push(c); } }
+    const { hlsUrl, referer } = await resolveVixCloudLike(targetUrl);
 
-    // verifica HLS reale
-    const checked=[];
-    for(const c of uniq){
-      const ok = await verifyIsHls(c.url, c._referer || embed);
-      if(ok) checked.push(c);
+    const ok = await verifyIsHls(hlsUrl, referer);
+    if (!ok) {
+      // fallback: apri comunque l'embed
+      return [buildExternal(embed)];
     }
 
-    if(!checked.length) return [buildExternal(embed)];
-
-    const streams = checked.map(c=>buildHlsStream(c.url, c.label, c._referer || embed));
-    streams.sort((a,b)=> qSortVal(b.quality) - qSortVal(a.quality));
+    const streams = [ buildHlsStream(hlsUrl, 'HLS (VixCloud)', referer) ];
     return streams;
 
   }catch(e){
-    log('Errore: '+e.message);
+    log('Errore: ' + e.message);
     const embed = buildEmbed(mediaType, tmdbId, seasonNum, episodeNum);
     return embed ? [buildExternal(embed)] : [];
   }
