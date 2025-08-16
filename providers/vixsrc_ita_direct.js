@@ -1,267 +1,204 @@
 // providers/vixsrc_ita_direct.js
 //
 // Scraper: "VixSrc (ITA • Direct)"
-// Obiettivo: usare gli embed ufficiali VixSrc (https://vixsrc.to) con ?lang=it
-// e risolvere direttamente URL .m3u8 senza proxy di terze parti.
-// Fallback: se non troviamo stream diretti validi, esponiamo l'embed "external".
+// Usa embed VixSrc (https://vixsrc.to) con ?lang=it e risolve HLS (.m3u8) senza proxy.
+// Fallback: se non troviamo HLS valido, esponiamo l'embed come "external".
 //
-// Compatibile con Nuvio/React Native: solo fetch + regex (nessuna dipendenza esterna).
-// Tutte le funzioni sono incluse (nessuna omissione).
+// NOTE CHIAVE:
+// - Stream di tipo HLS -> type: "m3u8" (ExoPlayer riconosce).
+// - Referer/Origin: usiamo SEMPRE la pagina iframe (se presente) come Referer; altrimenti l'embed.
+// - Validazione: GET e controllo che il corpo inizi con "#EXTM3U" (HEAD non basta su alcuni CDN).
+// - Nessuna dipendenza esterna: solo fetch + regex.
 
-// =====================
-// Config
-// =====================
 const VIXSRC_BASE = 'https://vixsrc.to';
 const FETCH_TIMEOUT = 15000;
 
-// Se alcune CDN bloccano HEAD, metti a false per non scartare link validi
-const ENABLE_HEAD_VALIDATION = false;
-
-const COMMON_HEADERS_HTML = {
+const HDR_HTML = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
   'Connection': 'keep-alive'
 };
 
-const COMMON_HEADERS_JSON = {
-  'User-Agent': COMMON_HEADERS_HTML['User-Agent'],
+const HDR_JSON = {
+  'User-Agent': HDR_HTML['User-Agent'],
   'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': COMMON_HEADERS_HTML['Accept-Language']
+  'Accept-Language': HDR_HTML['Accept-Language']
 };
 
-const QUALITY_ORDER = ['2160p', '4K', '1440p', '1080p', '720p', '480p', '360p'];
-
-// Host "tipo RapidCloud" spesso usati dietro VixSrc
-const RAPIDCLOUD_HOST_HINTS = [
-  'rabbitstream', 'rapid-cloud', 'vizcloud', 'vidcloud', 'mzzcloud', 'rcp'
-];
-
-// =====================
-// Utils
-// =====================
-function log(msg) { try { console.log('[VixSrcITA-Direct] ' + msg); } catch(_){} }
-
-function withTimeout(promise, ms) {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('timeout ' + ms + 'ms')), ms);
-    promise.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
-  });
-}
-
-async function makeText(url, headers) {
-  log('GET ' + url);
-  const resp = await withTimeout(fetch(url, { method: 'GET', headers: headers || COMMON_HEADERS_HTML }), FETCH_TIMEOUT);
-  if (!resp || !resp.ok) throw new Error('HTTP ' + (resp ? resp.status : 'ERR') + ' su ' + url);
-  return await resp.text();
-}
-
-async function makeJson(url, headers) {
-  log('GET JSON ' + url);
-  const resp = await withTimeout(fetch(url, { method: 'GET', headers: headers || COMMON_HEADERS_JSON }), FETCH_TIMEOUT);
-  if (!resp || !resp.ok) throw new Error('HTTP ' + (resp ? resp.status : 'ERR') + ' su ' + url);
-  return await resp.json();
-}
-
-async function headOk(url, headers) {
-  if (!ENABLE_HEAD_VALIDATION) return true; // disabilitata per evitare falsi negativi
-  try {
-    const resp = await fetch(url, { method: 'HEAD', headers: headers || {} });
-    return !!(resp && (resp.ok || resp.status === 206));
-  } catch {
-    return false;
-  }
-}
-
-function extractAllM3U8(text) {
-  if (!text) return [];
-  const re = /https?:\/\/[^\s"'<>]+?\.m3u8(?:\?[^\s"'<>]*)?/gi;
-  const out = [];
-  let m;
-  while ((m = re.exec(text)) !== null) out.push(m[0]);
-  const seen = {};
-  const uniq = [];
-  for (let i=0;i<out.length;i++) { const u = out[i]; if (!seen[u]) { seen[u]=true; uniq.push(u); } }
-  return uniq;
-}
-
-function firstIframeSrc(html, baseUrl) {
-  const re = /<iframe[^>]*\s+src=["']([^"'<>]+)["'][^>]*>/i;
-  const m = re.exec(html);
-  if (!m || !m[1]) return null;
-  try { return new URL(m[1], baseUrl).toString(); }
-  catch { return m[1]; }
-}
-
-function secondIframeSrc(html, baseUrl) {
-  // Prende il 2º iframe se presente
-  const re = /<iframe[^>]*\s+src=["']([^"'<>]+)["'][^>]*>/ig;
-  let m, count = 0, last = null;
-  while ((m = re.exec(html)) !== null) {
-    count++;
-    if (count === 2) {
-      last = m[1];
-      break;
-    }
-  }
-  if (!last) return null;
-  try { return new URL(last, baseUrl).toString(); }
-  catch { return last; }
-}
-
-function containsRapidCloudHost(url) {
-  const u = (url || '').toLowerCase();
-  return RAPIDCLOUD_HOST_HINTS.some(h => u.includes(h));
-}
-
-function extractQualityFromText(t) {
-  if (!t) return 'Unknown';
-  const T = String(t).toUpperCase();
-  for (let i=0;i<QUALITY_ORDER.length;i++) {
-    if (T.indexOf(QUALITY_ORDER[i].toUpperCase()) !== -1) return QUALITY_ORDER[i];
-  }
-  const m = T.match(/(\d{3,4})P/);
-  return m ? (m[1] + 'p') : 'Unknown';
-}
-
-function qForSort(q) {
-  if (!q) return 0;
-  const m = (q+'').match(/(\d{3,4})p/i);
-  if (m) return parseInt(m[1], 10);
-  return (String(q).toUpperCase() === '4K') ? 4000 : 0;
-}
-
-// =====================
-// URL embed VixSrc (ITA / fallback)
-// =====================
-function buildEmbedCandidates(mediaType, tmdbId, seasonNum, episodeNum) {
-  const base = VIXSRC_BASE.replace(/\/+$/, '');
-  const list = [];
-  if (mediaType === 'tv') {
-    if (!seasonNum || !episodeNum) return [];
-    list.push(`${base}/tv/${encodeURIComponent(String(tmdbId))}/${encodeURIComponent(String(seasonNum))}/${encodeURIComponent(String(episodeNum))}?lang=it`);
-    list.push(`${base}/tv/${encodeURIComponent(String(tmdbId))}/${encodeURIComponent(String(seasonNum))}/${encodeURIComponent(String(episodeNum))}`); // fallback senza lang
-    return list;
-  }
-  list.push(`${base}/movie/${encodeURIComponent(String(tmdbId))}?lang=it`);
-  list.push(`${base}/movie/${encodeURIComponent(String(tmdbId))}`); // fallback senza lang
-  return list;
-}
-
-// =====================
-// Risoluzione diretta
-// =====================
-
-async function resolveFromEmbed(embedUrl) {
-  const html = await makeText(embedUrl, COMMON_HEADERS_HTML);
-  const m3u8s = extractAllM3U8(html);
-  const iframe1 = firstIframeSrc(html, embedUrl);
-  const iframe2 = secondIframeSrc(html, embedUrl);
-  return { m3u8s, iframe1, iframe2, html };
-}
-
-async function resolveFromIframe(iframeUrl) {
-  if (!iframeUrl) return { m3u8s: [], innerIframe: null, html: '' };
-  const html = await makeText(iframeUrl, { ...COMMON_HEADERS_HTML, Referer: iframeUrl });
+// Per il GET di verifica HLS
+function hlsHeaders(referer, origin) {
   return {
-    m3u8s: extractAllM3U8(html),
-    innerIframe: firstIframeSrc(html, iframeUrl) || null,
-    html
+    'User-Agent': HDR_HTML['User-Agent'],
+    'Accept': 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
+    'Referer': referer || (origin ? origin + '/' : VIXSRC_BASE + '/'),
+    'Origin': origin || VIXSRC_BASE
   };
 }
 
-// RapidCloud / Rabbitstream / Vizcloud / Vidcloud
-async function resolveRapidCloud(iframeUrl) {
-  try {
+const QUALITY_ORDER = ['2160p', '4K', '1440p', '1080p', '720p', '480p', '360p'];
+const RAPIDCLOUD_HOST_HINTS = ['rabbitstream','rapid-cloud','vizcloud','vidcloud','mzzcloud','rcp'];
+
+function log(m){ try{ console.log('[VixSrcITA-Direct] ' + m);}catch(_){} }
+
+function withTimeout(promise, ms){
+  return new Promise((resolve,reject)=>{
+    const t = setTimeout(()=>reject(new Error('timeout '+ms+'ms')), ms);
+    promise.then(v=>{clearTimeout(t);resolve(v);},e=>{clearTimeout(t);reject(e);});
+  });
+}
+
+async function getText(url, headers){
+  log('GET ' + url);
+  const r = await withTimeout(fetch(url,{method:'GET',headers:headers||HDR_HTML}), FETCH_TIMEOUT);
+  if(!r || !r.ok) throw new Error('HTTP ' + (r?r.status:'ERR') + ' su ' + url);
+  return await r.text();
+}
+
+async function getJson(url, headers){
+  log('GET JSON ' + url);
+  const r = await withTimeout(fetch(url,{method:'GET',headers:headers||HDR_JSON}), FETCH_TIMEOUT);
+  if(!r || !r.ok) throw new Error('HTTP ' + (r?r.status:'ERR') + ' su ' + url);
+  return await r.json();
+}
+
+function extractAllM3U8(text){
+  if(!text) return [];
+  const re=/https?:\/\/[^\s"'<>]+?\.m3u8(?:\?[^\s"'<>]*)?/gi;
+  const list=[]; let m;
+  while((m=re.exec(text))!==null) list.push(m[0]);
+  const seen={}; const uniq=[];
+  for(let i=0;i<list.length;i++){ const u=list[i]; if(!seen[u]){seen[u]=true; uniq.push(u);} }
+  return uniq;
+}
+
+function firstIframeSrc(html, baseUrl){
+  const re=/<iframe[^>]*\s+src=["']([^"'<>]+)["'][^>]*>/i;
+  const m=re.exec(html);
+  if(!m||!m[1]) return null;
+  try { return new URL(m[1], baseUrl).toString(); } catch { return m[1]; }
+}
+
+function containsRapidCloudHost(url){
+  const u=(url||'').toLowerCase();
+  return RAPIDCLOUD_HOST_HINTS.some(h=>u.includes(h));
+}
+
+function qFromText(t){
+  if(!t) return 'Unknown';
+  const T=String(t).toUpperCase();
+  for(let i=0;i<QUALITY_ORDER.length;i++){
+    if(T.indexOf(QUALITY_ORDER[i].toUpperCase())!==-1) return QUALITY_ORDER[i];
+  }
+  const m=T.match(/(\d{3,4})P/);
+  return m ? (m[1]+'p') : 'Unknown';
+}
+function qSortVal(q){
+  if(!q) return 0;
+  const m=(q+'').match(/(\d{3,4})p/i);
+  if(m) return parseInt(m[1],10);
+  return (String(q).toUpperCase()==='4K') ? 4000 : 0;
+}
+
+function buildEmbed(mediaType, tmdbId, s, e){
+  const base = VIXSRC_BASE.replace(/\/+$/,'');
+  if(mediaType==='tv'){
+    if(!s||!e) return null;
+    return `${base}/tv/${encodeURIComponent(String(tmdbId))}/${encodeURIComponent(String(s))}/${encodeURIComponent(String(e))}?lang=it`;
+  }
+  return `${base}/movie/${encodeURIComponent(String(tmdbId))}?lang=it`;
+}
+
+// ---- Risoluzione ----
+
+async function resolveFromEmbed(embedUrl){
+  const html = await getText(embedUrl, HDR_HTML);
+  const m3u8s = extractAllM3U8(html);
+  const iframe = firstIframeSrc(html, embedUrl);
+  return { m3u8s, iframe, html };
+}
+
+async function resolveFromIframe(iframeUrl){
+  if(!iframeUrl) return [];
+  const html = await getText(iframeUrl, { ...HDR_HTML, Referer: iframeUrl });
+  return extractAllM3U8(html);
+}
+
+async function resolveRapidCloud(iframeUrl){
+  try{
     const u = new URL(iframeUrl);
     const origin = u.origin;
-    const html = await makeText(iframeUrl, { ...COMMON_HEADERS_HTML, Referer: iframeUrl });
 
-    // Estrai id
-    let id = null;
-    let m = html.match(/data-id=["']([A-Za-z0-9_-]{6,})["']/i);
-    if (m && m[1]) id = m[1];
-    if (!id) { m = html.match(/\sid=["']([A-Za-z0-9_-]{6,})["']/i); if (m && m[1]) id = m[1]; }
-    if (!id) { m = html.match(/id["'\s=:]+([A-Za-z0-9_-]{6,})/i) || html.match(/getSources\?id=([A-Za-z0-9_-]{6,})/i); if (m && m[1]) id = m[1]; }
+    const html = await getText(iframeUrl, { ...HDR_HTML, Referer: iframeUrl });
 
-    if (!id) {
-      log('RapidCloud: id non trovato.');
-      // prova a cercare direttamente m3u8 nell'html come fallback
-      const direct = extractAllM3U8(html);
-      return direct.map(u => ({ url: u, label: 'Stream' }));
-    }
+    let id = null, m = null;
+    m = html.match(/data-id=["']([A-Za-z0-9_-]{6,})["']/i); if(m&&m[1]) id=m[1];
+    if(!id){ m=html.match(/\sid=["']([A-Za-z0-9_-]{6,})["']/i); if(m&&m[1]) id=m[1];}
+    if(!id){ m=html.match(/id["'\s=:]+([A-Za-z0-9_-]{6,})/i) || html.match(/getSources\?id=([A-Za-z0-9_-]{6,})/i); if(m&&m[1]) id=m[1];}
 
-    const urlsToTry = [
+    if(!id){ log('RapidCloud: id non trovato'); return []; }
+
+    const endpoints=[
       `${origin}/ajax/embed-4/getSources?id=${encodeURIComponent(id)}`,
       `${origin}/ajax/embed/getSources?id=${encodeURIComponent(id)}`
     ];
-
-    const headers = {
-      ...COMMON_HEADERS_JSON,
-      'X-Requested-With': 'XMLHttpRequest',
+    const headers={
+      ...HDR_JSON,
+      'X-Requested-With':'XMLHttpRequest',
       'Referer': iframeUrl,
       'Origin': origin
     };
 
-    for (let i=0;i<urlsToTry.length;i++) {
-      try {
-        const j = await makeJson(urlsToTry[i], headers);
-        const candidates = collectM3u8FromRapidJson(j);
-        if (candidates.length) return candidates;
-      } catch (e) { /* next */ }
+    for(let i=0;i<endpoints.length;i++){
+      try{
+        const j = await getJson(endpoints[i], headers);
+        const out = collectRapidJson(j);
+        if(out.length) return out.map(o=>({ ...o, _referer: iframeUrl }));
+      }catch(_){}
     }
 
-    // fallback: cerca inner iframe
     const inner = firstIframeSrc(html, iframeUrl);
-    const more = inner ? extractAllM3U8(await makeText(inner, { ...COMMON_HEADERS_HTML, Referer: iframeUrl })) : [];
-    return more.map(u => ({ url: u, label: 'Stream' }));
-
-  } catch (e) { /* ignore */ }
+    if(inner){
+      const more = await resolveFromIframe(inner);
+      return more.map(u=>({url:u, label:'Stream', _referer: iframeUrl}));
+    }
+  }catch(_){}
   return [];
 }
 
-function collectM3u8FromRapidJson(j) {
-  const out = [];
-  function pushItem(url, label) {
-    if (url && /\.m3u8(\?|$)/i.test(url)) out.push({ url, label: label || 'Stream' });
-  }
-  if (!j) return out;
-
-  if (typeof j === 'string') { pushItem(j, 'Stream'); return out; }
-  if (j.hls) pushItem(j.hls, 'HLS');
-
-  const arr1 = Array.isArray(j.sources) ? j.sources : null;
+function collectRapidJson(j){
+  const out=[];
+  function push(url,label){ if(url && /\.m3u8(\?|$)/i.test(url)) out.push({url,label:label||'Stream'}); }
+  if(!j) return out;
+  if(typeof j==='string'){ push(j,'Stream'); return out; }
+  if(j.hls) push(j.hls,'HLS');
+  const arr1 = Array.isArray(j.sources)? j.sources : null;
   const arr2 = j.data && Array.isArray(j.data.sources) ? j.data.sources : null;
   const arr = arr1 || arr2 || [];
-  for (let i=0;i<arr.length;i++) {
-    const it = arr[i] || {};
-    pushItem(it.file || it.url, it.label || it.quality);
+  for(let i=0;i<arr.length;i++){
+    const it=arr[i]||{};
+    push(it.file||it.url, it.label||it.quality);
   }
   return out;
 }
 
-// =====================
-// Conversione in stream Nuvio
-// =====================
-function toDirectStream(url, label) {
-  const q = extractQualityFromText(label || url);
-  let origin;
-  try { origin = new URL(url).origin; } catch { origin = VIXSRC_BASE; }
+// ---- Costruzione stream Nuvio ----
+
+function buildHlsStream(url, label, refererHint){
+  const q = qFromText(label||url);
+  let origin; try{ origin=new URL(url).origin; }catch{ origin=VIXSRC_BASE; }
+  const ref = refererHint || (origin + '/');
   return {
     name: 'VixSrc (ITA • Direct)',
-    title: (q && q !== 'Unknown') ? (q + ' • ITA') : 'Stream • ITA',
+    title: (q && q!=='Unknown') ? (q + ' • ITA') : 'Stream • ITA',
     url: url,
     quality: q || 'Unknown',
-    type: 'direct',
-    headers: {
-      'Referer': origin + '/',
-      'User-Agent': COMMON_HEADERS_HTML['User-Agent'],
-      'Origin': origin
-    }
+    type: 'm3u8',
+    headers: hlsHeaders(ref, origin)
   };
 }
 
-function toExternalEmbed(embedUrl) {
+function buildExternal(embedUrl){
   return {
     name: 'VixSrc (Embed ITA)',
     title: 'Apri Player VixSrc (ITA)',
@@ -270,95 +207,78 @@ function toExternalEmbed(embedUrl) {
     type: 'external',
     headers: {
       'Referer': VIXSRC_BASE + '/',
-      'User-Agent': COMMON_HEADERS_HTML['User-Agent'],
+      'User-Agent': HDR_HTML['User-Agent'],
       'Origin': VIXSRC_BASE
     }
   };
 }
 
-// =====================
-// API principale (Nuvio)
-// =====================
-async function getStreams(tmdbId, mediaType = 'movie', seasonNum = null, episodeNum = null /*, _title, _year */) {
-  try {
-    const candidates = buildEmbedCandidates(mediaType, tmdbId, seasonNum, episodeNum);
-    if (!candidates.length) {
-      log('Parametri insufficienti per costruire l’embed.');
-      return [];
-    }
-
-    // prova prima l'embed con lang=it, poi quello senza lang
-    for (let c = 0; c < candidates.length; c++) {
-      const embed = candidates[c];
-
-      // A) pagina embed
-      const resA = await resolveFromEmbed(embed);
-      let pool = [...(resA.m3u8s || [])];
-
-      // B) primo iframe
-      const iframe1 = resA.iframe1 || null;
-      if (iframe1) {
-        const r1 = await resolveFromIframe(iframe1);
-        pool = pool.concat(r1.m3u8s || []);
-
-        // C) secondo iframe (generico)
-        if (r1.innerIframe) {
-          const r2 = await resolveFromIframe(r1.innerIframe);
-          pool = pool.concat(r2.m3u8s || []);
-        }
-      }
-
-      // D) host-specific RapidCloud
-      if (iframe1 && containsRapidCloudHost(iframe1)) {
-        const rc = await resolveRapidCloud(iframe1);
-        (rc || []).forEach(x => { if (x && x.url) pool.push(x.url); });
-      }
-
-      // Deduplica
-      const seen = {};
-      const uniq = [];
-      for (let i=0;i<pool.length;i++) {
-        const u = pool[i];
-        if (!seen[u]) { seen[u] = true; uniq.push(u); }
-      }
-
-      // Validazione (opzionale)
-      const validated = [];
-      for (let i=0;i<uniq.length;i++) {
-        const st = toDirectStream(uniq[i], uniq[i]);
-        const ok = await headOk(st.url, st.headers);
-        if (ok) validated.push(st);
-      }
-
-      // Se validazione disabilitata o nessuno passato, accetta comunque i link
-      let streams = validated;
-      if (!streams.length && uniq.length) {
-        streams = uniq.map(u => toDirectStream(u, u));
-      }
-
-      if (streams.length) {
-        // Ordina per qualità
-        streams.sort((a, b) => qForSort(b.quality) - qForSort(a.quality));
-        return streams;
-      }
-
-      // se questo candidate non ha dato niente, passa al prossimo (es. senza lang)
-    }
-
-    // Nessun candidate ha dato stream → almeno l'embed (senza lang se esiste)
-    const lastEmbed = candidates[candidates.length - 1];
-    return lastEmbed ? [toExternalEmbed(lastEmbed)] : [];
-
-  } catch (e) {
-    log('Errore: ' + e.message);
-    const fallback = buildEmbedCandidates(mediaType, tmdbId, seasonNum, episodeNum).pop();
-    return fallback ? [toExternalEmbed(fallback)] : [];
-  }
+// Verifica che l’URL risponda con una playlist HLS (inizio "#EXTM3U")
+async function verifyIsHls(url, refererHint){
+  let origin; try{ origin=new URL(url).origin; }catch{ origin=VIXSRC_BASE; }
+  const headers = hlsHeaders(refererHint || (origin + '/'), origin);
+  try{
+    const r = await withTimeout(fetch(url,{method:'GET', headers}), 12000);
+    if(!r || !r.ok) return false;
+    const text = await r.text();
+    return /^#EXTM3U/.test(text.trim().slice(0, 1024));
+  }catch(_){ return false; }
 }
 
 // =====================
-// Export per Nuvio
+// API principale
 // =====================
+async function getStreams(tmdbId, mediaType='movie', seasonNum=null, episodeNum=null){
+  try{
+    const embed = buildEmbed(mediaType, tmdbId, seasonNum, episodeNum);
+    if(!embed){ log('Parametri insufficienti'); return []; }
+
+    const resA = await resolveFromEmbed(embed);
+    let pool = (resA.m3u8s||[]).map(u=>({url:u, label:'Stream', _referer: embed}));
+
+    const iframeUrl = resA.iframe || null;
+    if(iframeUrl){
+      const more = await resolveFromIframe(iframeUrl);
+      pool = pool.concat(more.map(u=>({url:u, label:'Stream', _referer: iframeUrl})));
+    }
+
+    if(iframeUrl && containsRapidCloudHost(iframeUrl)){
+      const rc = await resolveRapidCloud(iframeUrl);
+      pool = pool.concat(rc||[]);
+    }
+
+    // dedup
+    const seen={}; const uniq=[];
+    for(let i=0;i<pool.length;i++){
+      const u = pool[i] && pool[i].url;
+      if(u && !seen[u]){ seen[u]=true; uniq.push(pool[i]); }
+    }
+
+    // verifica reale HLS
+    const checked = [];
+    for(let i=0;i<uniq.length;i++){
+      const cand = uniq[i];
+      const ok = await verifyIsHls(cand.url, cand._referer || embed);
+      if(ok) checked.push(cand);
+    }
+
+    if(!checked.length){
+      return [buildExternal(embed)];
+    }
+
+    // costruisci stream HLS + sort qualità
+    const streams = checked.map(c => buildHlsStream(c.url, c.label, c._referer || embed));
+    streams.sort((a,b)=> qSortVal(b.quality) - qSortVal(a.quality));
+    return streams;
+
+  }catch(e){
+    log('Errore: ' + e.message);
+    const embed = buildEmbed(mediaType, tmdbId, seasonNum, episodeNum);
+    return embed ? [buildExternal(embed)] : [];
+  }
+}
+
+// Export
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { getStreams };
 } else {
