@@ -1,28 +1,12 @@
-// vixsrc_ita_direct.js
+// providers/vixsrc_ita_direct.js
 //
 // Scraper: "VixSrc (ITA • Direct)"
 // Obiettivo: usare gli embed ufficiali VixSrc (https://vixsrc.to) con ?lang=it
 // e risolvere direttamente URL .m3u8 senza proxy di terze parti.
 // Fallback: se non troviamo stream diretti validi, esponiamo l'embed "external".
 //
-// Compatibile con React Native (Nuvio): usa fetch; nessun modulo Node nativo (no fs/path/crypto).
-// Usa cheerio-without-node-native per parsing HTML.
-// Tutte le funzioni sono incluse (nessuna omissione), come richiesto.
-//
-// NOTE IMPORTANTI:
-// - Questo risolutore copre tre vie:
-//   A) Ricerca .m3u8 direttamente nell'HTML dell'embed VixSrc
-//   B) Se l'embed include un <iframe>, proviamo anche lì (una profondità)
-//   C) Host-specific "RapidCloud/Rabbitstream/Vizcloud/Vidcloud" (pattern molto comune dietro VixSrc):
-//      tentiamo la chiamata JSON "/ajax/embed-4/getSources?id=..." o "/ajax/embed/getSources?id=..."
-// - Se in futuro VixSrc cambia markup o host, si estende la funzione resolveRapidCloud() aggiungendo casi.
-// - Il provider privilegia contenuti italiani passando `?lang=it` sugli URL embed di VixSrc.
-//
-// Riferimenti utili su come vanno strutturati i provider e il manifest nel repo:
-// - README del repo Nuvio (struttura, manifest, test).
-//
-// Dipendenze (solo per test locale Node): npm i cheerio-without-node-native
-const cheerio = require('cheerio-without-node-native');
+// Compatibile con Nuvio/React Native: usa solo fetch + regex (nessuna dipendenza esterna).
+// Tutte le funzioni sono incluse (nessuna omissione).
 
 // =====================
 // Config
@@ -98,11 +82,12 @@ function extractAllM3U8(text) {
 }
 
 function firstIframeSrc(html, baseUrl) {
-  const $ = cheerio.load(html);
-  const el = $('iframe[src]').first();
-  if (!el || !el.attr('src')) return null;
-  try { return new URL(el.attr('src'), baseUrl).toString(); }
-  catch { return el.attr('src'); }
+  // Regex robusta per <iframe ... src="...">
+  const re = /<iframe[^>]*\s+src=["']([^"'<>]+)["'][^>]*>/i;
+  const m = re.exec(html);
+  if (!m || !m[1]) return null;
+  try { return new URL(m[1], baseUrl).toString(); }
+  catch { return m[1]; }
 }
 
 function containsRapidCloudHost(url) {
@@ -163,12 +148,26 @@ async function resolveRapidCloud(iframeUrl) {
   try {
     const u = new URL(iframeUrl);
     const origin = u.origin;
-    const html = await makeText(iframeUrl, { ...COMMON_HEADERS_HTML, Referer: iframeUrl });
-    const $ = cheerio.load(html);
-    let id = $('[data-id]').attr('data-id') || $('*[id]').attr('id') || null;
 
+    // Carica HTML dell'iframe per cercare un id
+    const html = await makeText(iframeUrl, { ...COMMON_HEADERS_HTML, Referer: iframeUrl });
+
+    // Estrai id da data-id / id / script
+    let id = null;
+
+    // data-id="..."
+    let m = html.match(/data-id=["']([A-Za-z0-9_-]{6,})["']/i);
+    if (m && m[1]) id = m[1];
+
+    // id="..."
     if (!id) {
-      const m = html.match(/(?:id["'\\s=:]+)([A-Za-z0-9_-]{6,})/i) || html.match(/getSources\\?id=([A-Za-z0-9_-]{6,})/i);
+      m = html.match(/\sid=["']([A-Za-z0-9_-]{6,})["']/i);
+      if (m && m[1]) id = m[1];
+    }
+
+    // id:"..."  oppure  getSources?id=...
+    if (!id) {
+      m = html.match(/id["'\s=:]+([A-Za-z0-9_-]{6,})/i) || html.match(/getSources\?id=([A-Za-z0-9_-]{6,})/i);
       if (m && m[1]) id = m[1];
     }
 
@@ -197,9 +196,10 @@ async function resolveRapidCloud(iframeUrl) {
       } catch (e) { /* prova il prossimo */ }
     }
 
-    const innerIframe = firstIframeSrc(html, iframeUrl);
-    if (innerIframe) {
-      const more = await resolveFromIframe(innerIframe);
+    // a volte c'è un secondo iframe
+    const inner = firstIframeSrc(html, iframeUrl);
+    if (inner) {
+      const more = await resolveFromIframe(inner);
       return more;
     }
   } catch (e) { /* ignore */ }
@@ -209,7 +209,7 @@ async function resolveRapidCloud(iframeUrl) {
 function collectM3u8FromRapidJson(j) {
   const out = [];
   function pushItem(url, label) {
-    if (url && /\\.m3u8(\\?|$)/i.test(url)) out.push({ url, label: label || 'Stream' });
+    if (url && /\.m3u8(\?|$)/i.test(url)) out.push({ url, label: label || 'Stream' });
   }
   if (!j) return out;
 
@@ -324,7 +324,7 @@ async function getStreams(tmdbId, mediaType = 'movie', seasonNum = null, episode
 }
 
 // =====================
-// Export per Nuvio (RN)
+// Export per Nuvio
 // =====================
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { getStreams };
