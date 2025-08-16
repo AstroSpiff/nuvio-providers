@@ -5,7 +5,7 @@
 // e risolvere direttamente URL .m3u8 senza proxy di terze parti.
 // Fallback: se non troviamo stream diretti validi, esponiamo l'embed "external".
 //
-// Compatibile con Nuvio/React Native: usa solo fetch + regex (nessuna dipendenza esterna).
+// Compatibile con Nuvio/React Native: solo fetch + regex (nessuna dipendenza esterna).
 // Tutte le funzioni sono incluse (nessuna omissione).
 
 // =====================
@@ -13,6 +13,9 @@
 // =====================
 const VIXSRC_BASE = 'https://vixsrc.to';
 const FETCH_TIMEOUT = 15000;
+
+// Se alcune CDN bloccano HEAD, metti a false per non scartare link validi
+const ENABLE_HEAD_VALIDATION = false;
 
 const COMMON_HEADERS_HTML = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
@@ -29,7 +32,7 @@ const COMMON_HEADERS_JSON = {
 
 const QUALITY_ORDER = ['2160p', '4K', '1440p', '1080p', '720p', '480p', '360p'];
 
-// Host "tipo RapidCloud" spesso usati dietro VixSrc (nomi possono variare nel tempo)
+// Host "tipo RapidCloud" spesso usati dietro VixSrc
 const RAPIDCLOUD_HOST_HINTS = [
   'rabbitstream', 'rapid-cloud', 'vizcloud', 'vidcloud', 'mzzcloud', 'rcp'
 ];
@@ -61,6 +64,7 @@ async function makeJson(url, headers) {
 }
 
 async function headOk(url, headers) {
+  if (!ENABLE_HEAD_VALIDATION) return true; // disabilitata per evitare falsi negativi
   try {
     const resp = await fetch(url, { method: 'HEAD', headers: headers || {} });
     return !!(resp && (resp.ok || resp.status === 206));
@@ -82,12 +86,27 @@ function extractAllM3U8(text) {
 }
 
 function firstIframeSrc(html, baseUrl) {
-  // Regex robusta per <iframe ... src="...">
   const re = /<iframe[^>]*\s+src=["']([^"'<>]+)["'][^>]*>/i;
   const m = re.exec(html);
   if (!m || !m[1]) return null;
   try { return new URL(m[1], baseUrl).toString(); }
   catch { return m[1]; }
+}
+
+function secondIframeSrc(html, baseUrl) {
+  // Prende il 2º iframe se presente
+  const re = /<iframe[^>]*\s+src=["']([^"'<>]+)["'][^>]*>/ig;
+  let m, count = 0, last = null;
+  while ((m = re.exec(html)) !== null) {
+    count++;
+    if (count === 2) {
+      last = m[1];
+      break;
+    }
+  }
+  if (!last) return null;
+  try { return new URL(last, baseUrl).toString(); }
+  catch { return last; }
 }
 
 function containsRapidCloudHost(url) {
@@ -113,67 +132,63 @@ function qForSort(q) {
 }
 
 // =====================
-// URL embed VixSrc (ITA)
+// URL embed VixSrc (ITA / fallback)
 // =====================
-function buildVixsrcEmbedUrl(mediaType, tmdbId, seasonNum, episodeNum) {
+function buildEmbedCandidates(mediaType, tmdbId, seasonNum, episodeNum) {
   const base = VIXSRC_BASE.replace(/\/+$/, '');
+  const list = [];
   if (mediaType === 'tv') {
-    if (!seasonNum || !episodeNum) return null;
-    return `${base}/tv/${encodeURIComponent(String(tmdbId))}/${encodeURIComponent(String(seasonNum))}/${encodeURIComponent(String(episodeNum))}?lang=it`;
+    if (!seasonNum || !episodeNum) return [];
+    list.push(`${base}/tv/${encodeURIComponent(String(tmdbId))}/${encodeURIComponent(String(seasonNum))}/${encodeURIComponent(String(episodeNum))}?lang=it`);
+    list.push(`${base}/tv/${encodeURIComponent(String(tmdbId))}/${encodeURIComponent(String(seasonNum))}/${encodeURIComponent(String(episodeNum))}`); // fallback senza lang
+    return list;
   }
-  return `${base}/movie/${encodeURIComponent(String(tmdbId))}?lang=it`;
+  list.push(`${base}/movie/${encodeURIComponent(String(tmdbId))}?lang=it`);
+  list.push(`${base}/movie/${encodeURIComponent(String(tmdbId))}`); // fallback senza lang
+  return list;
 }
 
 // =====================
 // Risoluzione diretta
 // =====================
 
-// A) pagina embed
 async function resolveFromEmbed(embedUrl) {
   const html = await makeText(embedUrl, COMMON_HEADERS_HTML);
   const m3u8s = extractAllM3U8(html);
-  const iframe = firstIframeSrc(html, embedUrl);
-  return { m3u8s, iframe, html };
+  const iframe1 = firstIframeSrc(html, embedUrl);
+  const iframe2 = secondIframeSrc(html, embedUrl);
+  return { m3u8s, iframe1, iframe2, html };
 }
 
-// B) primo iframe
 async function resolveFromIframe(iframeUrl) {
-  if (!iframeUrl) return [];
+  if (!iframeUrl) return { m3u8s: [], innerIframe: null, html: '' };
   const html = await makeText(iframeUrl, { ...COMMON_HEADERS_HTML, Referer: iframeUrl });
-  return extractAllM3U8(html);
+  return {
+    m3u8s: extractAllM3U8(html),
+    innerIframe: firstIframeSrc(html, iframeUrl) || null,
+    html
+  };
 }
 
-// C) host-specific RapidCloud/Rabbitstream/Vizcloud/Vidcloud
+// RapidCloud / Rabbitstream / Vizcloud / Vidcloud
 async function resolveRapidCloud(iframeUrl) {
   try {
     const u = new URL(iframeUrl);
     const origin = u.origin;
-
-    // Carica HTML dell'iframe per cercare un id
     const html = await makeText(iframeUrl, { ...COMMON_HEADERS_HTML, Referer: iframeUrl });
 
-    // Estrai id da data-id / id / script
+    // Estrai id
     let id = null;
-
-    // data-id="..."
     let m = html.match(/data-id=["']([A-Za-z0-9_-]{6,})["']/i);
     if (m && m[1]) id = m[1];
-
-    // id="..."
-    if (!id) {
-      m = html.match(/\sid=["']([A-Za-z0-9_-]{6,})["']/i);
-      if (m && m[1]) id = m[1];
-    }
-
-    // id:"..."  oppure  getSources?id=...
-    if (!id) {
-      m = html.match(/id["'\s=:]+([A-Za-z0-9_-]{6,})/i) || html.match(/getSources\?id=([A-Za-z0-9_-]{6,})/i);
-      if (m && m[1]) id = m[1];
-    }
+    if (!id) { m = html.match(/\sid=["']([A-Za-z0-9_-]{6,})["']/i); if (m && m[1]) id = m[1]; }
+    if (!id) { m = html.match(/id["'\s=:]+([A-Za-z0-9_-]{6,})/i) || html.match(/getSources\?id=([A-Za-z0-9_-]{6,})/i); if (m && m[1]) id = m[1]; }
 
     if (!id) {
       log('RapidCloud: id non trovato.');
-      return [];
+      // prova a cercare direttamente m3u8 nell'html come fallback
+      const direct = extractAllM3U8(html);
+      return direct.map(u => ({ url: u, label: 'Stream' }));
     }
 
     const urlsToTry = [
@@ -193,15 +208,14 @@ async function resolveRapidCloud(iframeUrl) {
         const j = await makeJson(urlsToTry[i], headers);
         const candidates = collectM3u8FromRapidJson(j);
         if (candidates.length) return candidates;
-      } catch (e) { /* prova il prossimo */ }
+      } catch (e) { /* next */ }
     }
 
-    // a volte c'è un secondo iframe
+    // fallback: cerca inner iframe
     const inner = firstIframeSrc(html, iframeUrl);
-    if (inner) {
-      const more = await resolveFromIframe(inner);
-      return more;
-    }
+    const more = inner ? extractAllM3U8(await makeText(inner, { ...COMMON_HEADERS_HTML, Referer: iframeUrl })) : [];
+    return more.map(u => ({ url: u, label: 'Stream' }));
+
   } catch (e) { /* ignore */ }
   return [];
 }
@@ -267,59 +281,78 @@ function toExternalEmbed(embedUrl) {
 // =====================
 async function getStreams(tmdbId, mediaType = 'movie', seasonNum = null, episodeNum = null /*, _title, _year */) {
   try {
-    const embed = buildVixsrcEmbedUrl(mediaType, tmdbId, seasonNum, episodeNum);
-    if (!embed) {
+    const candidates = buildEmbedCandidates(mediaType, tmdbId, seasonNum, episodeNum);
+    if (!candidates.length) {
       log('Parametri insufficienti per costruire l’embed.');
       return [];
     }
 
-    // A) pagina embed
-    const resA = await resolveFromEmbed(embed);
-    let pool = [...(resA.m3u8s || [])];
+    // prova prima l'embed con lang=it, poi quello senza lang
+    for (let c = 0; c < candidates.length; c++) {
+      const embed = candidates[c];
 
-    // B) primo iframe
-    const iframeUrl = resA.iframe || null;
-    if (iframeUrl) {
-      const more = await resolveFromIframe(iframeUrl);
-      pool = pool.concat(more || []);
+      // A) pagina embed
+      const resA = await resolveFromEmbed(embed);
+      let pool = [...(resA.m3u8s || [])];
+
+      // B) primo iframe
+      const iframe1 = resA.iframe1 || null;
+      if (iframe1) {
+        const r1 = await resolveFromIframe(iframe1);
+        pool = pool.concat(r1.m3u8s || []);
+
+        // C) secondo iframe (generico)
+        if (r1.innerIframe) {
+          const r2 = await resolveFromIframe(r1.innerIframe);
+          pool = pool.concat(r2.m3u8s || []);
+        }
+      }
+
+      // D) host-specific RapidCloud
+      if (iframe1 && containsRapidCloudHost(iframe1)) {
+        const rc = await resolveRapidCloud(iframe1);
+        (rc || []).forEach(x => { if (x && x.url) pool.push(x.url); });
+      }
+
+      // Deduplica
+      const seen = {};
+      const uniq = [];
+      for (let i=0;i<pool.length;i++) {
+        const u = pool[i];
+        if (!seen[u]) { seen[u] = true; uniq.push(u); }
+      }
+
+      // Validazione (opzionale)
+      const validated = [];
+      for (let i=0;i<uniq.length;i++) {
+        const st = toDirectStream(uniq[i], uniq[i]);
+        const ok = await headOk(st.url, st.headers);
+        if (ok) validated.push(st);
+      }
+
+      // Se validazione disabilitata o nessuno passato, accetta comunque i link
+      let streams = validated;
+      if (!streams.length && uniq.length) {
+        streams = uniq.map(u => toDirectStream(u, u));
+      }
+
+      if (streams.length) {
+        // Ordina per qualità
+        streams.sort((a, b) => qForSort(b.quality) - qForSort(a.quality));
+        return streams;
+      }
+
+      // se questo candidate non ha dato niente, passa al prossimo (es. senza lang)
     }
 
-    // C) host-specific RapidCloud
-    if (iframeUrl && containsRapidCloudHost(iframeUrl)) {
-      const rc = await resolveRapidCloud(iframeUrl);
-      pool = pool.concat(rc || []);
-    }
-
-    // Deduplica
-    const seen = {};
-    const uniq = [];
-    for (let i=0;i<pool.length;i++) {
-      const u = pool[i];
-      if (!seen[u]) { seen[u] = true; uniq.push(u); }
-    }
-
-    // Validazione HEAD -> streams diretti
-    const validations = await Promise.all(uniq.map(async (u) => {
-      const st = toDirectStream(u, u);
-      const ok = await headOk(st.url, st.headers);
-      return ok ? st : null;
-    }));
-
-    const streams = validations.filter(Boolean);
-
-    if (!streams.length) {
-      // Niente diretti: offriamo l'embed
-      return [toExternalEmbed(embed)];
-    }
-
-    // Ordina per qualità
-    streams.sort((a, b) => qForSort(b.quality) - qForSort(a.quality));
-    return streams;
+    // Nessun candidate ha dato stream → almeno l'embed (senza lang se esiste)
+    const lastEmbed = candidates[candidates.length - 1];
+    return lastEmbed ? [toExternalEmbed(lastEmbed)] : [];
 
   } catch (e) {
     log('Errore: ' + e.message);
-    const embed = buildVixsrcEmbedUrl(mediaType, tmdbId, seasonNum, episodeNum);
-    return embed ? [toExternalEmbed(embed)] : [];
+    const fallback = buildEmbedCandidates(mediaType, tmdbId, seasonNum, episodeNum).pop();
+    return fallback ? [toExternalEmbed(fallback)] : [];
   }
 }
 
